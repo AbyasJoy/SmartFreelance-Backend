@@ -109,6 +109,7 @@ public class GeminiAIService implements AIService {
         sysParts.add(Map.of("text", systemInstructionText));
         systemInstruction.put("parts", sysParts);
         requestBody.put("systemInstruction", systemInstruction);
+        requestBody.put("system_instruction", systemInstruction);
 
         // Contents (User Message + Context)
         List<Map<String, Object>> contents = new ArrayList<>();

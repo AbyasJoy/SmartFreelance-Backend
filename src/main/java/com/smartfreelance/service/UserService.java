@@ -3,6 +3,7 @@ package com.smartfreelance.service;
 import com.smartfreelance.dto.LoginRequest;
 import com.smartfreelance.dto.LoginResponse;
 import com.smartfreelance.entity.User;
+import com.smartfreelance.exception.UserAlreadyExistsException;
 import com.smartfreelance.repository.UserRepository;
 import com.smartfreelance.security.JwtService;
 import org.springframework.security.authentication.BadCredentialsException;
@@ -30,7 +31,7 @@ public class UserService {
         }
 
         if (userRepository.findByEmail(email).isPresent()) {
-            throw new RuntimeException("Email is already in use: " + email);
+            throw new UserAlreadyExistsException("Email is already in use: " + email);
         }
 
         User user = new User();
