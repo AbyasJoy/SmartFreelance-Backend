@@ -75,8 +75,33 @@ class AIServiceTest {
 
         Map body = (Map) captor.getValue().getBody();
         assertNotNull(body);
-        assertTrue(body.containsKey("system_instruction"));
+        assertTrue(body.containsKey("systemInstruction"));
         assertTrue(body.containsKey("contents"));
+    }
+
+    @Test
+    void chat_ContainsExactlyOneSystemInstructionField() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+
+        Map<String, Object> mockCandidate = Map.of(
+                "content", Map.of(
+                        "parts", List.of(Map.of("text", "System instruction check reply.")),
+                        "role", "model"
+                )
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenReturn(new ResponseEntity<>(Map.of("candidates", List.of(mockCandidate)), HttpStatus.OK));
+
+        AIChatRequest request = new AIChatRequest("Check system instruction field in payload");
+        aiService.chat(request);
+
+        ArgumentCaptor<HttpEntity> captor = ArgumentCaptor.forClass(HttpEntity.class);
+        verify(apiClient).postForEntity(anyString(), captor.capture(), eq(Map.class));
+
+        Map body = (Map) captor.getValue().getBody();
+        assertNotNull(body);
+        assertTrue(body.containsKey("systemInstruction"), "Body must contain valid 'systemInstruction' field");
+        assertFalse(body.containsKey("system_instruction"), "Body MUST NOT contain duplicate 'system_instruction' field to prevent 400 Bad Request error on Gemini API");
     }
 
     @Test
@@ -129,7 +154,7 @@ class AIServiceTest {
         verify(apiClient).postForEntity(anyString(), captor.capture(), eq(Map.class));
 
         Map body = (Map) captor.getValue().getBody();
-        Map sysInst = (Map) body.get("system_instruction");
+        Map sysInst = (Map) body.get("systemInstruction");
         List parts = (List) sysInst.get("parts");
         Map textPart = (Map) parts.get(0);
         String sysText = (String) textPart.get("text");
@@ -158,7 +183,7 @@ class AIServiceTest {
         verify(apiClient).postForEntity(anyString(), captor.capture(), eq(Map.class));
 
         Map body = (Map) captor.getValue().getBody();
-        Map sysInst = (Map) body.get("system_instruction");
+        Map sysInst = (Map) body.get("systemInstruction");
         List parts = (List) sysInst.get("parts");
         Map textPart = (Map) parts.get(0);
         String sysText = (String) textPart.get("text");
@@ -188,7 +213,7 @@ class AIServiceTest {
         verify(apiClient).postForEntity(anyString(), captor.capture(), eq(Map.class));
 
         Map body = (Map) captor.getValue().getBody();
-        Map sysInst = (Map) body.get("system_instruction");
+        Map sysInst = (Map) body.get("systemInstruction");
         List sysParts = (List) sysInst.get("parts");
         String sysText = (String) ((Map) sysParts.get(0)).get("text");
 
