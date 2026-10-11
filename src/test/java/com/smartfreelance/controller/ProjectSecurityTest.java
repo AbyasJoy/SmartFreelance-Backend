@@ -16,11 +16,21 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDate;
+import com.smartfreelance.dto.ProjectResponse;
+import com.smartfreelance.entity.Category;
+import com.smartfreelance.entity.Skill;
+import com.smartfreelance.repository.CategoryRepository;
+import com.smartfreelance.repository.SkillRepository;
+import org.springframework.test.web.servlet.MvcResult;
 
+import java.time.LocalDate;
+import java.util.List;
+
+import static org.hamcrest.Matchers.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @SpringBootTest
@@ -34,6 +44,12 @@ class ProjectSecurityTest {
 
     @Autowired
     private UserRepository userRepository;
+
+    @Autowired
+    private CategoryRepository categoryRepository;
+
+    @Autowired
+    private SkillRepository skillRepository;
 
     @Autowired
     private JwtService jwtService;
@@ -163,6 +179,66 @@ class ProjectSecurityTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isCreated());
+    }
+
+    @Test
+    @DisplayName("Project creation with category and skills associations succeeds and populates skills in response and details")
+    void testCreateProjectWithSkillsAndCategory() throws Exception {
+        Category category = categoryRepository.findAll().stream().findFirst().orElseGet(() ->
+                categoryRepository.save(new Category(null, "Test Category", "Desc", true))
+        );
+
+        List<Skill> allSkills = skillRepository.findAll();
+        if (allSkills.isEmpty()) {
+            allSkills = List.of(
+                    skillRepository.save(new Skill(null, "TestSkill1", true)),
+                    skillRepository.save(new Skill(null, "TestSkill2", true))
+            );
+        }
+        List<Long> skillIds = allSkills.stream().limit(2).map(Skill::getId).toList();
+
+        ProjectRequest request = new ProjectRequest(
+                "Full Stack Skill Project",
+                "Full Stack project testing skill associations",
+                "1800.00",
+                LocalDate.now().plusDays(25).toString(),
+                clientId,
+                category.getId(),
+                skillIds
+        );
+
+        MvcResult createResult = mockMvc.perform(post("/api/projects")
+                        .header("Authorization", clientToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.id").exists())
+                .andExpect(jsonPath("$.categoryId").value(category.getId()))
+                .andExpect(jsonPath("$.categoryName").value(category.getName()))
+                .andExpect(jsonPath("$.skillIds", hasSize(skillIds.size())))
+                .andReturn();
+
+        ProjectResponse createdResponse = objectMapper.readValue(
+                createResult.getResponse().getContentAsString(),
+                ProjectResponse.class
+        );
+        Long createdId = createdResponse.getId();
+
+        // Verify GET /api/projects/{id} returns the project with skills populated
+        mockMvc.perform(get("/api/projects/" + createdId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(createdId))
+                .andExpect(jsonPath("$.skillIds", hasSize(skillIds.size())))
+                .andExpect(jsonPath("$.skillNames", notNullValue()));
+
+        // Verify filtering by skill via GET /api/projects/page?skillId=...
+        Long firstSkillId = skillIds.get(0);
+        mockMvc.perform(get("/api/projects/page")
+                        .param("skillId", firstSkillId.toString())
+                        .param("page", "0")
+                        .param("size", "10"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content", not(empty())));
     }
 
     @Test

@@ -27,6 +27,7 @@ import org.springframework.security.access.AccessDeniedException;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -81,6 +82,67 @@ class ProjectServiceTest {
         assertEquals(10L, response.getId());
         assertEquals("Java Web App", response.getTitle());
         assertEquals("OPEN", response.getStatus());
+    }
+
+    @Test
+    void testCreateProject_WithCategoryAndSkills_Success() {
+        when(currentUserService.getCurrentUser()).thenReturn(clientUser);
+        when(userRepository.existsById(1L)).thenReturn(true);
+        Category category = new Category(5L, "Backend & APIs", "Backend description", true);
+        when(categoryRepository.findById(5L)).thenReturn(Optional.of(category));
+
+        List<Skill> skills = List.of(
+                new Skill(1L, "Java", true),
+                new Skill(2L, "Spring Boot", true)
+        );
+        when(skillRepository.findAllById(List.of(1L, 2L))).thenReturn(skills);
+
+        when(projectRepository.save(any(Project.class))).thenAnswer(inv -> {
+            Project p = inv.getArgument(0);
+            p.setId(25L);
+            return p;
+        });
+
+        ProjectRequest request = new ProjectRequest(
+                "Microservice Backend",
+                "Build scalable Spring Boot APIs",
+                "2500.00",
+                "2026-12-31",
+                1L,
+                5L,
+                List.of(1L, 2L)
+        );
+
+        ProjectResponse response = projectService.createProject(request);
+
+        assertNotNull(response);
+        assertEquals(25L, response.getId());
+        assertEquals("Microservice Backend", response.getTitle());
+        assertEquals("OPEN", response.getStatus());
+        assertEquals(5L, response.getCategoryId());
+        assertEquals("Backend & APIs", response.getCategoryName());
+        assertNotNull(response.getSkillIds());
+        assertEquals(2, response.getSkillIds().size());
+        assertTrue(response.getSkillIds().containsAll(List.of(1L, 2L)));
+        assertEquals(List.of("Java", "Spring Boot"), response.getSkillNames());
+    }
+
+    @Test
+    void testCreateProject_AdminOverrideClient_Success() {
+        when(currentUserService.getCurrentUser()).thenReturn(adminUser);
+        when(userRepository.existsById(1L)).thenReturn(true);
+        when(projectRepository.save(any(Project.class))).thenAnswer(inv -> {
+            Project p = inv.getArgument(0);
+            p.setId(30L);
+            return p;
+        });
+
+        ProjectRequest request = new ProjectRequest("Admin Managed Project", "Created on behalf of client", "2000.00", "2026-11-30", 1L);
+        ProjectResponse response = projectService.createProject(request);
+
+        assertNotNull(response);
+        assertEquals(30L, response.getId());
+        assertEquals(1L, response.getClientId());
     }
 
     @Test
