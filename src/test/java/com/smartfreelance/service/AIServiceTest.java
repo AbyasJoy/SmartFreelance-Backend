@@ -11,10 +11,15 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientException;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -34,6 +39,7 @@ class AIServiceTest {
     private GeminiAIService aiService;
 
     private User testUser;
+    private List<Long> recordedSleeps;
 
     @BeforeEach
     void setUp() {
@@ -43,7 +49,9 @@ class AIServiceTest {
         testUser.setEmail("client@example.com");
         testUser.setRole("CLIENT");
 
-        aiService = new GeminiAIService(currentUserService, apiClient, "test-api-key-12345", "gemini-3.8-flash");
+        recordedSleeps = new ArrayList<>();
+        aiService = new GeminiAIService(currentUserService, apiClient, "test-api-key-12345", "gemini-2.5-flash");
+        aiService.setSleeper(recordedSleeps::add);
     }
 
     @Test
@@ -67,7 +75,7 @@ class AIServiceTest {
 
         assertNotNull(response);
         assertEquals("SUCCESS", response.getStatus());
-        assertEquals("gemini-3.8-flash", response.getModel());
+        assertEquals("gemini-2.5-flash", response.getModel());
         assertEquals("Hello! I can help you plan your freelance project deliverables.", response.getReply());
 
         ArgumentCaptor<HttpEntity> captor = ArgumentCaptor.forClass(HttpEntity.class);
@@ -118,18 +126,169 @@ class AIServiceTest {
     }
 
     @Test
-    void chat_GeminiApiErrorOrTimeout_ReturnsSafeFallbackWithoutLeakingSecrets() {
+    void chat_Http503HighDemand_RetriesWithBackoffAndReturnsClearUserFriendlyError() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpServerErrorException serviceUnavailableEx = new HttpServerErrorException(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "503 Service Unavailable: The model is overloaded. Please try again later."
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(serviceUnavailableEx);
+
+        AIChatRequest request = new AIChatRequest("High demand test prompt");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        // Verify user-friendly error specifically addresses high demand
+        assertTrue(response.getReply().contains("experiencing high demand on Google's API servers"),
+                "Reply should clearly communicate high demand: " + response.getReply());
+
+        // Verify retries occurred up to max retries (3 attempts total, 2 sleeps)
+        verify(apiClient, times(3)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(2, recordedSleeps.size());
+
+        // Verify exponential backoff: attempt 1 sleep is >= 1000ms, attempt 2 sleep is >= 2000ms
+        assertTrue(recordedSleeps.get(0) >= 1000L, "First backoff should be >= 1000ms, was " + recordedSleeps.get(0));
+        assertTrue(recordedSleeps.get(1) >= 2000L, "Second backoff should be >= 2000ms, was " + recordedSleeps.get(1));
+    }
+
+    @Test
+    void chat_TransientHttp503_SucceedsOnSecondAttempt() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpServerErrorException serviceUnavailableEx = new HttpServerErrorException(
+                HttpStatus.SERVICE_UNAVAILABLE, "503 Service Unavailable"
+        );
+
+        Map<String, Object> mockCandidate = Map.of(
+                "content", Map.of(
+                        "parts", List.of(Map.of("text", "Successfully recovered on retry!")),
+                        "role", "model"
+                )
+        );
+        ResponseEntity<Map> successResponse = new ResponseEntity<>(Map.of("candidates", List.of(mockCandidate)), HttpStatus.OK);
+
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(serviceUnavailableEx)
+                .thenReturn(successResponse);
+
+        AIChatRequest request = new AIChatRequest("Prompt during transient blip");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("SUCCESS", response.getStatus());
+        assertEquals("Successfully recovered on retry!", response.getReply());
+        verify(apiClient, times(2)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(1, recordedSleeps.size());
+    }
+
+    @Test
+    void chat_Http429WithRetryAfter_RespectsRetryAfterHeader() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, "3");
+        HttpClientErrorException rateLimitEx = HttpClientErrorException.create(
+                HttpStatus.TOO_MANY_REQUESTS, "Too Many Requests", headers, null, null
+        );
+
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(rateLimitEx);
+
+        AIChatRequest request = new AIChatRequest("Rate limit test");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        assertTrue(response.getReply().contains("receiving too many requests"),
+                "Reply should state too many requests: " + response.getReply());
+
+        verify(apiClient, times(3)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(2, recordedSleeps.size());
+        // Verify sleep respected 3s Retry-After (3000ms + 50-200ms jitter)
+        assertTrue(recordedSleeps.get(0) >= 3000L && recordedSleeps.get(0) <= 3300L,
+                "Sleep duration should reflect 3s Retry-After plus jitter: " + recordedSleeps.get(0));
+    }
+
+    @Test
+    void chat_PermanentHttp400BadRequest_FailsImmediatelyWithoutRetrying() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpClientErrorException badRequestEx = HttpClientErrorException.create(
+                HttpStatus.BAD_REQUEST, "Bad Request: Invalid value", HttpHeaders.EMPTY, null, null
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(badRequestEx);
+
+        AIChatRequest request = new AIChatRequest("Malformed request test");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        assertTrue(response.getReply().contains("invalid request format"));
+
+        // Must not retry permanent 400 errors
+        verify(apiClient, times(1)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(0, recordedSleeps.size());
+    }
+
+    @Test
+    void chat_PermanentHttp401Unauthorized_FailsImmediatelyWithoutRetrying() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpClientErrorException unauthorizedEx = HttpClientErrorException.create(
+                HttpStatus.UNAUTHORIZED, "Unauthorized: API key not valid", HttpHeaders.EMPTY, null, null
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(unauthorizedEx);
+
+        AIChatRequest request = new AIChatRequest("Bad API key test");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        assertTrue(response.getReply().contains("authentication error"));
+
+        // Must not retry permanent 401 error
+        verify(apiClient, times(1)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(0, recordedSleeps.size());
+    }
+
+    @Test
+    void chat_PermanentHttp404NotFound_FailsImmediatelyWithoutRetrying() {
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpClientErrorException notFoundEx = HttpClientErrorException.create(
+                HttpStatus.NOT_FOUND, "Not Found: Model gemini-2.5-flash not found", HttpHeaders.EMPTY, null, null
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(notFoundEx);
+
+        AIChatRequest request = new AIChatRequest("Model not found test");
+        AIChatResponse response = aiService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        assertTrue(response.getReply().contains("unavailable or unsupported"));
+
+        // Must not retry permanent 404 error
+        verify(apiClient, times(1)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(0, recordedSleeps.size());
+    }
+
+    @Test
+    void chat_TransientNetworkTimeout_RetriesAndReturnsFriendlyFallbackWithoutLeakingSecrets() {
         when(currentUserService.getCurrentUser()).thenReturn(testUser);
         when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
-                .thenThrow(new RestClientException("Connection timed out"));
+                .thenThrow(new ResourceAccessException("Connection timed out to https://generativelanguage.googleapis.com?key=test-api-key-12345"));
 
         AIChatRequest request = new AIChatRequest("Explain milestone payments");
         AIChatResponse response = aiService.chat(request);
 
         assertNotNull(response);
         assertEquals("ERROR", response.getStatus());
-        assertTrue(response.getReply().contains("currently unavailable"));
+        assertTrue(response.getReply().contains("temporarily unavailable"));
         assertFalse(response.getReply().contains("test-api-key-12345"), "Response must not leak API key");
+
+        // Network timeouts are transient, so they are retried
+        verify(apiClient, times(3)).postForEntity(anyString(), any(), eq(Map.class));
+        assertEquals(2, recordedSleeps.size());
     }
 
     @Test

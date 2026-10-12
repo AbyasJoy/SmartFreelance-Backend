@@ -10,10 +10,13 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpStatusCodeException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
@@ -22,14 +25,24 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 
 @Service
 public class GeminiAIService implements AIService {
 
     private static final Logger logger = LoggerFactory.getLogger(GeminiAIService.class);
 
+    public static final int DEFAULT_MAX_RETRIES = 3;
+    public static final long BASE_BACKOFF_MS = 1000L;
+    public static final long MAX_BACKOFF_MS = 8000L;
+
     public interface GeminiApiClient {
         ResponseEntity<Map> postForEntity(String url, HttpEntity<Map<String, Object>> entity, Class<Map> responseType);
+    }
+
+    @FunctionalInterface
+    public interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
     }
 
     @Component
@@ -52,12 +65,13 @@ public class GeminiAIService implements AIService {
     @Value("${gemini.api-key:}")
     private String apiKey;
 
-    @Value("${gemini.model:gemini-3.5-flash}")
+    @Value("${gemini.model:gemini-2.5-flash}")
     private String model;
 
     private final CurrentUserService currentUserService;
     private final GeminiApiClient apiClient;
     private final RAGRetrievalService ragRetrievalService;
+    private Sleeper sleeper = Thread::sleep;
 
     @org.springframework.beans.factory.annotation.Autowired
     public GeminiAIService(CurrentUserService currentUserService, GeminiApiClient apiClient, RAGRetrievalService ragRetrievalService) {
@@ -131,7 +145,7 @@ public class GeminiAIService implements AIService {
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
 
-        int maxRetries = 3;
+        int maxRetries = DEFAULT_MAX_RETRIES;
         RestClientException lastRestClientException = null;
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -141,30 +155,140 @@ public class GeminiAIService implements AIService {
                     String reply = extractReplyFromResponse(responseEntity.getBody());
                     return new AIChatResponse(reply, "SUCCESS", model);
                 } else {
-                    logger.warn("Gemini API attempt {}/{} failed with status: {}", attempt, maxRetries, responseEntity != null ? responseEntity.getStatusCode() : "null");
+                    HttpStatusCode statusCode = responseEntity != null ? responseEntity.getStatusCode() : null;
+                    int code = statusCode != null ? statusCode.value() : 0;
+                    logger.warn("Gemini API attempt {}/{} returned non-successful status: {}", attempt, maxRetries, statusCode);
+                    if (!isRetryableStatusCode(code)) {
+                        logger.warn("Encountered permanent non-successful HTTP status {}. Aborting retries.", code);
+                        break;
+                    }
+                    if (attempt < maxRetries) {
+                        long delayMs = computeBackoffDelay(attempt, -1L);
+                        logger.info("Retrying Gemini API request in {}ms (attempt {}/{})", delayMs, attempt + 1, maxRetries);
+                        sleeper.sleep(delayMs);
+                    }
                 }
             } catch (RestClientException e) {
                 lastRestClientException = e;
-                logger.warn("Gemini API attempt {}/{} exception: {}", attempt, maxRetries, e.getMessage());
+                String safeMsg = sanitize(e.getMessage());
+                logger.warn("Gemini API attempt {}/{} exception: {}", attempt, maxRetries, safeMsg);
+
+                if (!isRetryableException(e)) {
+                    logger.warn("Encountered non-retryable client error. Aborting retries without delay.");
+                    break;
+                }
+
                 if (attempt < maxRetries) {
+                    long retryAfterMillis = extractRetryAfterMillis(e);
+                    long delayMs = computeBackoffDelay(attempt, retryAfterMillis);
+                    logger.info("Temporary failure on attempt {}/{}. Retrying with backoff in {}ms...", attempt, maxRetries, delayMs);
                     try {
-                        Thread.sleep(1000L * attempt);
+                        sleeper.sleep(delayMs);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
+                        logger.warn("Gemini API retry wait interrupted.");
                         break;
                     }
                 }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                logger.warn("Gemini API execution interrupted.");
+                break;
             } catch (Exception e) {
-                logger.error("Unexpected error during AI chat processing: {}", e.getMessage());
+                logger.error("Unexpected error during AI chat processing: {}", sanitize(e.getMessage()));
                 return new AIChatResponse("An unexpected error occurred. Please try again later.", "ERROR", model);
             }
         }
 
-        logger.error("Gemini API request failed after {} attempts: {}", maxRetries, lastRestClientException != null ? lastRestClientException.getMessage() : "Unknown error");
-        String errorDetail = lastRestClientException != null && lastRestClientException.getMessage() != null && lastRestClientException.getMessage().contains("503")
-                ? "The AI model is currently under high demand on Google's API server. Please retry in a few moments."
-                : "The AI Assistant is currently unavailable. Please try again later.";
-        return new AIChatResponse(errorDetail, "ERROR", model);
+        String safeLastErr = lastRestClientException != null ? sanitize(lastRestClientException.getMessage()) : "Unknown error";
+        logger.error("Gemini API request failed after {} attempts: {}", maxRetries, safeLastErr);
+        String userFriendlyError = resolveErrorMessage(lastRestClientException);
+        return new AIChatResponse(userFriendlyError, "ERROR", model);
+    }
+
+    private boolean isRetryableStatusCode(int statusCode) {
+        return statusCode == 429 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
+    }
+
+    private boolean isRetryableException(RestClientException e) {
+        if (e instanceof HttpStatusCodeException httpEx) {
+            return isRetryableStatusCode(httpEx.getStatusCode().value());
+        }
+        if (e instanceof ResourceAccessException) {
+            return true;
+        }
+        String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+        if (msg.contains("400") || msg.contains("401") || msg.contains("403") || msg.contains("404")) {
+            return false;
+        }
+        return msg.contains("503") || msg.contains("429") || msg.contains("timed out") || msg.contains("timeout") || msg.contains("connection reset");
+    }
+
+    private long extractRetryAfterMillis(RestClientException e) {
+        if (e instanceof HttpStatusCodeException httpEx) {
+            try {
+                HttpHeaders headers = httpEx.getResponseHeaders();
+                if (headers != null) {
+                    String retryAfter = headers.getFirst(HttpHeaders.RETRY_AFTER);
+                    if (retryAfter != null && !retryAfter.trim().isEmpty()) {
+                        long seconds = Long.parseLong(retryAfter.trim());
+                        if (seconds > 0) {
+                            return seconds * 1000L;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // Header could be absent or non-numeric
+            }
+        }
+        return -1L;
+    }
+
+    private long computeBackoffDelay(int attempt, long retryAfterMillis) {
+        if (retryAfterMillis > 0) {
+            long jitter = ThreadLocalRandom.current().nextLong(50, 201);
+            return Math.min(retryAfterMillis + jitter, MAX_BACKOFF_MS);
+        }
+        long exponential = BASE_BACKOFF_MS * (1L << (attempt - 1));
+        long jitter = ThreadLocalRandom.current().nextLong(100, 501);
+        return Math.min(exponential + jitter, MAX_BACKOFF_MS);
+    }
+
+    private String resolveErrorMessage(RestClientException e) {
+        if (e == null) {
+            return "The AI Assistant is temporarily unavailable. Please try again in a few moments.";
+        }
+        if (e instanceof HttpStatusCodeException httpEx) {
+            int code = httpEx.getStatusCode().value();
+            if (code == 503) {
+                return "The AI Assistant is currently experiencing high demand on Google's API servers. Please retry in a few moments.";
+            } else if (code == 429) {
+                return "The AI Assistant is currently receiving too many requests. Please wait a moment and try again.";
+            } else if (code == 401 || code == 403) {
+                return "AI Assistant authentication error. Please verify the Gemini API key configuration.";
+            } else if (code == 404) {
+                return "The configured AI model ('" + model + "') is currently unavailable or unsupported. Please check the GEMINI_MODEL setting.";
+            } else if (code == 400) {
+                return "The AI Assistant received an invalid request format. Please refine your message and try again.";
+            }
+        }
+        String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+        if (msg.contains("503") || msg.contains("overloaded") || msg.contains("high demand") || msg.contains("unavailable")) {
+            return "The AI Assistant is currently experiencing high demand on Google's API servers. Please retry in a few moments.";
+        }
+        if (msg.contains("429") || msg.contains("too many requests") || msg.contains("rate limit")) {
+            return "The AI Assistant is currently receiving too many requests. Please wait a moment and try again.";
+        }
+        if (msg.contains("401") || msg.contains("403") || msg.contains("unauthorized") || msg.contains("forbidden") || msg.contains("api key")) {
+            return "AI Assistant authentication error. Please verify the Gemini API key configuration.";
+        }
+        if (msg.contains("404") || msg.contains("not found")) {
+            return "The configured AI model ('" + model + "') is currently unavailable or unsupported. Please check the GEMINI_MODEL setting.";
+        }
+        if (msg.contains("400") || msg.contains("bad request")) {
+            return "The AI Assistant received an invalid request format. Please refine your message and try again.";
+        }
+        return "The AI Assistant is temporarily unavailable. Please try again shortly.";
     }
 
     private String buildSystemInstruction(String userName, String userRole, String knowledgeContext) {
@@ -205,11 +329,25 @@ public class GeminiAIService implements AIService {
         return "Thank you for your inquiry. I am here to help you navigate SmartFreelance!";
     }
 
+    private String sanitize(String message) {
+        if (message == null) {
+            return "null";
+        }
+        if (apiKey != null && !apiKey.trim().isEmpty()) {
+            return message.replace(apiKey, "[REDACTED]");
+        }
+        return message;
+    }
+
     public void setApiKey(String apiKey) {
         this.apiKey = apiKey;
     }
 
     public void setModel(String model) {
         this.model = model;
+    }
+
+    public void setSleeper(Sleeper sleeper) {
+        this.sleeper = sleeper;
     }
 }
