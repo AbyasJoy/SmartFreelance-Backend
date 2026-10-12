@@ -50,7 +50,7 @@ class AIServiceTest {
         testUser.setRole("CLIENT");
 
         recordedSleeps = new ArrayList<>();
-        aiService = new GeminiAIService(currentUserService, apiClient, "test-api-key-12345", "gemini-2.5-flash");
+        aiService = new GeminiAIService(currentUserService, apiClient, "test-api-key-12345", "gemini-3.5-flash");
         aiService.setSleeper(recordedSleeps::add);
     }
 
@@ -75,7 +75,7 @@ class AIServiceTest {
 
         assertNotNull(response);
         assertEquals("SUCCESS", response.getStatus());
-        assertEquals("gemini-2.5-flash", response.getModel());
+        assertEquals("gemini-3.5-flash", response.getModel());
         assertEquals("Hello! I can help you plan your freelance project deliverables.", response.getReply());
 
         ArgumentCaptor<HttpEntity> captor = ArgumentCaptor.forClass(HttpEntity.class);
@@ -255,7 +255,7 @@ class AIServiceTest {
     void chat_PermanentHttp404NotFound_FailsImmediatelyWithoutRetrying() {
         when(currentUserService.getCurrentUser()).thenReturn(testUser);
         HttpClientErrorException notFoundEx = HttpClientErrorException.create(
-                HttpStatus.NOT_FOUND, "Not Found: Model gemini-2.5-flash not found", HttpHeaders.EMPTY, null, null
+                HttpStatus.NOT_FOUND, "Not Found: Model gemini-3.5-flash not found", HttpHeaders.EMPTY, null, null
         );
         when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
                 .thenThrow(notFoundEx);
@@ -265,11 +265,33 @@ class AIServiceTest {
 
         assertNotNull(response);
         assertEquals("ERROR", response.getStatus());
-        assertTrue(response.getReply().contains("unavailable or unsupported"));
+        assertEquals("The configured AI model ('gemini-3.5-flash') is currently unavailable or unsupported. Please check the GEMINI_MODEL setting.",
+                response.getReply());
 
         // Must not retry permanent 404 error
         verify(apiClient, times(1)).postForEntity(anyString(), any(), eq(Map.class));
         assertEquals(0, recordedSleeps.size());
+    }
+
+    @Test
+    void chat_ModelNotFound_ReturnsExactConfiguredModelInErrorMessage() {
+        GeminiAIService customModelService = new GeminiAIService(currentUserService, apiClient, "test-api-key", "gemini-2.5-flash");
+        when(currentUserService.getCurrentUser()).thenReturn(testUser);
+        HttpClientErrorException notFoundEx = HttpClientErrorException.create(
+                HttpStatus.NOT_FOUND, "Not Found: models/gemini-2.5-flash is not found", HttpHeaders.EMPTY, null, null
+        );
+        when(apiClient.postForEntity(anyString(), any(), eq(Map.class)))
+                .thenThrow(notFoundEx);
+
+        AIChatRequest request = new AIChatRequest("Check unsupported model error");
+        AIChatResponse response = customModelService.chat(request);
+
+        assertNotNull(response);
+        assertEquals("ERROR", response.getStatus());
+        assertEquals("gemini-2.5-flash", response.getModel());
+        assertEquals("The configured AI model ('gemini-2.5-flash') is currently unavailable or unsupported. Please check the GEMINI_MODEL setting.",
+                response.getReply());
+        verify(apiClient, times(1)).postForEntity(anyString(), any(), eq(Map.class));
     }
 
     @Test
